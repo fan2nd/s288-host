@@ -1,0 +1,12 @@
+[application]
+name = "s288-host"
+default_platform = "desktop"
+
+[web.app]
+title = "UNITREE S288"
+
+[desktop]
+window_title = "UNITREE S288"
+window_width = 1440
+window_height = 900
+resizable = true
