@@ -38,7 +38,7 @@ const FIELDS: [Field; 5] = [
     Field("目标速度", "°/s", -60., 60., 0.1),
     Field("前馈力矩", "N·m", -3., 3., 0.01),
     Field("位置增益 Kp", "N·m/rad", 0., 10., 0.01),
-    Field("阻尼增益 Kd", "N·m·s/rad", 0., 10., 0.01),
+    Field("阻尼增益 Kd", "(N·m)/(rad/s)", 0., 10., 0.01),
 ];
 fn defaults() -> [String; 5] {
     ["0", "0", "0", "10", "0.5"].map(str::to_owned)
