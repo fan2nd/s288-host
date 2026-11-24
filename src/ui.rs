@@ -1,321 +1,343 @@
-use crate::serial::{scan_serial_ports, ControlMode, SerialManager};
+use crate::protocol::Feedback;
+use crate::serial::{scan_serial_ports, SerialManager, Setpoint};
 use dioxus::prelude::*;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 const STYLE: &str = include_str!("../assets/style.css");
 
-fn mode_label(mode: ControlMode) -> &'static str {
-    match mode {
-        ControlMode::Position => "POSITION",
-        ControlMode::Velocity => "VELOCITY",
-        ControlMode::Torque => "TORQUE",
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    Position,
+    Velocity,
+    Torque,
+    Mit,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Position => "位置",
+            Self::Velocity => "速度",
+            Self::Torque => "力矩",
+            Self::Mit => "MIT",
+        }
     }
-}
-
-fn mode_unit(mode: ControlMode) -> &'static str {
-    match mode {
-        ControlMode::Position => "°",
-        ControlMode::Velocity => "°/s",
-        ControlMode::Torque => "N·m",
-    }
-}
-
-fn mode_min(mode: ControlMode) -> f64 {
-    match mode {
-        ControlMode::Position => -180.0,
-        ControlMode::Velocity => -60.0,
-        ControlMode::Torque => -3.0,
-    }
-}
-
-fn mode_max(mode: ControlMode) -> f64 {
-    match mode {
-        ControlMode::Position => 180.0,
-        ControlMode::Velocity => 60.0,
-        ControlMode::Torque => 3.0,
-    }
-}
-
-fn mode_step(mode: ControlMode) -> f64 {
-    match mode {
-        ControlMode::Position | ControlMode::Velocity => 0.1,
-        ControlMode::Torque => 0.01,
-    }
-}
-
-fn position_degrees(radians: f32) -> f32 {
-    radians.to_degrees()
-}
-
-fn speed_degrees(radians_per_second: f32) -> f32 {
-    radians_per_second.to_degrees()
-}
-
-fn live_control_handler(
-    serial: Arc<SerialManager>,
-    mut last_command: Signal<String>,
-    motor_id: Signal<u8>,
-    mode: Signal<ControlMode>,
-    mut target: Signal<f64>,
-    kp: Signal<f64>,
-    kd: Signal<f64>,
-) -> impl FnMut(Event<FormData>) {
-    move |event| {
-        let current_mode = mode();
-        let value = event
-            .value()
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .clamp(mode_min(current_mode), mode_max(current_mode));
-        target.set(value);
-        if serial.connected.load(Ordering::SeqCst) {
-            match serial.send_control("LIVE", motor_id(), current_mode, value as f64, kp(), kd()) {
-                Ok(()) => last_command.set(format!(
-                    "LIVE {} ID{} / FC EE OK",
-                    mode_label(current_mode),
-                    motor_id()
-                )),
-                Err(error) => last_command.set(format!("SERIAL ERROR / {error}")),
-            }
+    fn fields(self) -> &'static [usize] {
+        match self {
+            Self::Position => &[0, 3, 4],
+            Self::Velocity => &[1, 4],
+            Self::Torque => &[2],
+            Self::Mit => &[0, 1, 2, 3, 4],
         }
     }
 }
 
-fn live_gain_handler(
-    serial: Arc<SerialManager>,
-    mut last_command: Signal<String>,
-    motor_id: Signal<u8>,
-    mode: Signal<ControlMode>,
-    target: Signal<f64>,
-    mut kp: Signal<f64>,
-    mut kd: Signal<f64>,
-    is_kp: bool,
-) -> impl FnMut(Event<FormData>) {
-    move |event| {
-        let value = event
-            .value()
-            .parse::<f64>()
-            .unwrap_or(if is_kp { 10.0 } else { 0.5 });
-        if is_kp {
-            kp.set(value);
-        } else {
-            kd.set(value);
-        }
-        if serial.connected.load(Ordering::SeqCst) {
-            match serial.send_control("LIVE GAIN", motor_id(), mode(), target() as f64, kp(), kd())
-            {
-                Ok(()) => last_command.set(format!("LIVE GAIN ID{} / FC EE OK", motor_id())),
-                Err(error) => last_command.set(format!("SERIAL ERROR / {error}")),
-            }
-        }
-    }
+struct Field(&'static str, &'static str, f64, f64, f64);
+const FIELDS: [Field; 5] = [
+    Field("目标位置", "°", -180., 180., 0.1),
+    Field("目标速度", "°/s", -60., 60., 0.1),
+    Field("前馈力矩", "N·m", -3., 3., 0.01),
+    Field("位置增益 Kp", "N·m/rad", 0., 10., 0.01),
+    Field("阻尼增益 Kd", "N·m·s/rad", 0., 10., 0.01),
+];
+fn defaults() -> [String; 5] {
+    ["0", "0", "0", "10", "0.5"].map(str::to_owned)
 }
 
-fn mode_handler(
-    serial: Arc<SerialManager>,
-    mut last_command: Signal<String>,
-    motor_id: Signal<u8>,
-    mut mode: Signal<ControlMode>,
-    mut target: Signal<f64>,
-    kp: Signal<f64>,
-    kd: Signal<f64>,
-    next_mode: ControlMode,
-) -> impl FnMut(Event<MouseData>) {
-    move |_| {
-        mode.set(next_mode);
-        target.set(0.0);
-        if serial.connected.load(Ordering::SeqCst) {
-            match serial.send_control("MODE", motor_id(), next_mode, 0.0, kp(), kd()) {
-                Ok(()) => last_command.set(format!(
-                    "MODE {} ID{} / FC EE OK",
-                    mode_label(next_mode),
-                    motor_id()
-                )),
-                Err(error) => last_command.set(format!("SERIAL ERROR / {error}")),
-            }
+fn setpoint(mode: Mode, draft: &[String; 5]) -> Result<Setpoint, Vec<usize>> {
+    let mut values = [0.; 5];
+    let mut invalid = Vec::new();
+    for &i in mode.fields() {
+        match draft[i].parse::<f64>() {
+            Ok(v) if (FIELDS[i].2..=FIELDS[i].3).contains(&v) => values[i] = v,
+            _ => invalid.push(i),
         }
     }
+    if !invalid.is_empty() {
+        return Err(invalid);
+    }
+    Ok(Setpoint {
+        position_deg: values[0],
+        velocity_deg_s: values[1],
+        torque_nm: values[2],
+        kp: values[3],
+        kd: values[4],
+    })
+}
+
+fn show_error(mut message: Signal<String>, text: impl Into<String>, focus: &str) {
+    message.set(text.into());
+    document::eval(&format!("const d=document.querySelector('dialog'); d.onclose=()=>document.getElementById('{focus}')?.focus(); if(!d.open)d.showModal();"));
 }
 
 pub fn app() -> Element {
-    let serial = Arc::new(use_hook(SerialManager::new));
+    let serial = use_hook(SerialManager::new);
     let mut connected = use_signal(|| false);
     let mut ports = use_signal(scan_serial_ports);
-    let mut selected_port = use_signal(|| scan_serial_ports().first().cloned().unwrap_or_default());
-    let mut motor_id = use_signal(|| 0_u8);
-    let mut known_ids = use_signal(Vec::<u8>::new);
-    let control_mode = use_signal(|| ControlMode::Position);
-    let target_position = use_signal(|| 0.0_f64);
-    let kp = use_signal(|| 10.0_f64);
-    let kd = use_signal(|| 0.5_f64);
-    let mut last_command = use_signal(|| "READY".to_string());
-    let mut rx_count = use_signal(|| 0_u32);
-    let mut feedback_id = use_signal(|| 0_u8);
-    let mut position = use_signal(|| 0.0_f32);
-    let mut speed = use_signal(|| 0.0_f32);
-    let mut torque = use_signal(|| 0.0_f32);
-    let mut temperature = use_signal(|| 0_i8);
-    let mut voltage = use_signal(|| 0.0_f32);
-    let mut error = use_signal(|| 0_u32);
-    let mut warning = use_signal(|| 0_u8);
+    let mut port = use_signal(|| ports.read().first().cloned().unwrap_or_default());
+    let mut id = use_signal(|| 0u8);
+    let mut ids = use_signal(Vec::<u8>::new);
+    let mut mode = use_signal(|| Mode::Position);
+    let mut basic = use_signal(|| Mode::Position);
+    let standard_values = use_signal(defaults);
+    let mit_values = use_signal(defaults);
+    let mut draft = if mode() == Mode::Mit {
+        mit_values
+    } else {
+        standard_values
+    };
+    let mut feedback = use_signal(|| None::<Feedback>);
+    let mut received = use_signal(|| 0u64);
+    let mut status = use_signal(|| "未应用控制".to_owned());
+    let message = use_signal(String::new);
 
-    {
-        let serial = serial.clone();
-        use_future(move || {
-            let serial = serial.clone();
-            async move {
-                loop {
-                    connected.set(serial.connected.load(Ordering::SeqCst));
-                    known_ids.set(serial.discovered_ids());
-                    for message in serial.take_logs() {
-                        last_command.set(message);
-                        rx_count += 1;
-                    }
-                    if let Some(feedback) = serial.latest() {
-                        feedback_id.set(feedback.motor_id);
-                        position.set(feedback.position);
-                        speed.set(feedback.speed);
-                        torque.set(feedback.torque);
-                        temperature.set(feedback.temp);
-                        voltage.set(feedback.voltage);
-                        error.set(feedback.error);
-                        warning.set(feedback.warning);
-                    }
-                    tokio::time::sleep(Duration::from_millis(70)).await;
-                }
+    let reader = serial.clone();
+    use_future(move || {
+        let reader = reader.clone();
+        async move {
+            loop {
+                feedback.set(reader.latest());
+                received.set(reader.rx_count());
+                ids.set(reader.discovered_ids());
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    });
+
+    use_effect(|| {
+        document::eval(
+            r#"
+            if (!window.s288StopKey) {
+                window.s288StopKey = e => {
+                    if(e.code !== 'Space' || document.getElementById('stop')?.disabled) return;
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    if(e.type === 'keydown' && !e.repeat) document.getElementById('stop').click();
+                };
+                window.addEventListener('keydown',window.s288StopKey,true);
+                window.addEventListener('keyup',window.s288StopKey,true);
+            }
+        "#,
+        );
+    });
+
+    let link = serial.clone();
+    let stopper = serial.clone();
+    let stop_output = use_callback(move |()| match stopper.stop(id()) {
+        Ok(id) => status.set(format!("ID {id} · 已切换至零力矩")),
+        Err(()) => {
+            status.set("已取消旧指令 · 停止未确认".into());
+            show_error(
+                message,
+                "未收到停止反馈。正在重复发送零力矩指令，请检查设备状态。",
+                "stop",
+            );
+        }
+    });
+    let switch_mode = use_callback(move |next: Mode| {
+        if next == mode() {
+            return;
+        }
+        if connected() {
+            stop_output.call(());
+        }
+        if next != Mode::Mit {
+            basic.set(next);
+        }
+        mode.set(next);
+    });
+    let fb = if connected() { feedback() } else { None };
+    let feedback_state = fb
+        .as_ref()
+        .map(|f| format!("ID {}", f.motor_id))
+        .unwrap_or_else(|| {
+            if connected() {
+                "等待反馈".into()
+            } else {
+                "未连接".into()
             }
         });
-    }
-
-    let serial_for_connection = serial.clone();
-
+    let measurements = [
+        (
+            "输出位置",
+            "°",
+            fb.as_ref()
+                .map(|f| format!("{:+.1}", f.position.to_degrees())),
+        ),
+        (
+            "输出速度",
+            "°/s",
+            fb.as_ref().map(|f| format!("{:+.1}", f.speed.to_degrees())),
+        ),
+        (
+            "输出力矩",
+            "N·m",
+            fb.as_ref().map(|f| format!("{:+.2}", f.torque)),
+        ),
+    ];
+    let health = [
+        ("壳体温度", fb.as_ref().map(|f| format!("{} °C", f.temp))),
+        (
+            "母线电压",
+            fb.as_ref().map(|f| format!("{:.1} V", f.voltage)),
+        ),
+        (
+            "设备故障",
+            fb.as_ref().map(|f| {
+                if f.error == 0 {
+                    "无".into()
+                } else {
+                    "存在故障".into()
+                }
+            }),
+        ),
+        (
+            "设备警告",
+            fb.as_ref().map(|f| {
+                if f.warning == 0 {
+                    "无".into()
+                } else {
+                    "存在警告".into()
+                }
+            }),
+        ),
+    ];
     rsx! {
         style { "{STYLE}" }
-        div { class: "app",
-            aside { class: "sidebar",
-                div { class: "brand",
-                    div { class: "brand-mark" }
-                    div { class: "brand-copy",
-                        div { class: "brand-name", "S288" }
-                        div { class: "brand-sub", "SERVO HOST" }
-                    }
-                }
-                div { class: "eyebrow side-heading", "MENU" }
-                nav { class: "nav",
-                    button { class: "nav-item active", "◈", span { "Servo console" } }
-                }
-                div { class: "side-bottom",
-                    div { class: "eyebrow side-heading", "BUS" }
-                    div { class: "side-card",
-                        div { class: "side-card-row", span { class: "side-label", "Baudrate" }, span { class: "side-value", "6 Mbps" } }
-                        div { class: "side-card-row", span { class: "side-label", "Format" }, span { class: "side-value", "8N1" } }
-                        div { class: "side-card-row", span { class: "side-label", "TX / RX" }, span { class: "side-value", "20 / 26 B" } }
-                    }
-                }
+        header { class:"mast",
+            div { class:"brand", div { class:"brand-logo", role:"img", aria_label:"宇树科技", dangerous_inner_html: include_str!("../assets/unitree.svg") } strong { "S288" } span { "伺服控制台" } }
+            div { class:"session",
+                span { class:if connected() {"state online"} else {"state"}, if connected() {"串口已连接"} else {"串口未连接"} }
+                button { id:"stop", class:"stop", disabled:!connected(), onclick:move |_| {
+                    stop_output.call(());
+                }, "■ 停止输出" kbd { "空格" } }
             }
-            main { class: "main",
-                header { class: "topbar",
-                    div { div { class: "eyebrow", "UNITREE S288" }, h1 { class: "page-title", "Servo console" } }
-                    div { class: "top-actions",
-                        select { class: "port-select", value: "{selected_port()}", onchange: move |event| selected_port.set(event.value()),
-                            if ports().is_empty() { option { value: "", "NO SERIAL PORT" } }
-                            for port in ports() { option { value: "{port}", "{port}" } }
-                        }
-                        div { class: "connection",
-                            span { class: "status-dot", style: if connected() { "" } else { "background: var(--red); box-shadow: none;" } }
-                            span { if connected() { "6 MBPS ONLINE" } else { "SERIAL OFFLINE" } }
-                        }
-                        button { class: "connect-btn", onclick: move |_| {
-                            if serial_for_connection.connected.load(Ordering::SeqCst) {
-                                serial_for_connection.disconnect();
-                                connected.set(false);
-                                last_command.set("SERIAL CLOSED".to_string());
-                            } else if selected_port().is_empty() {
-                                last_command.set("NO SERIAL PORT FOUND".to_string());
-                            } else {
-                                match serial_for_connection.connect(&selected_port()) {
-                                    Ok(()) => last_command.set("SERIAL OPEN".to_string()),
-                                    Err(error) => last_command.set(format!("OPEN FAILED / {error}")),
-                                }
-                            }
-                        }, if connected() { "DISCONNECT" } else { "CONNECT" } }
-                        button { class: "round-btn", title: "Refresh ports", onclick: move |_| {
-                            let found = scan_serial_ports();
-                            if selected_port().is_empty() {
-                                if let Some(port) = found.first() { selected_port.set(port.clone()); }
-                            }
-                            ports.set(found);
-                        }, "↻" }
-                    }
+        }
+        main {
+            section { class:"linkbar",
+                label { r#for:"port", "串口" }
+                select { id:"port", disabled:connected(), value:"{port()}", onchange:move |e|port.set(e.value()),
+                    if ports().is_empty() { option { value:"", "未发现串口" } }
+                    for p in ports() { option { value:"{p}", "{p}" } }
                 }
-                div { class: "grid",
-                    section { class: "panel servo-panel",
-                        div { class: "panel-head",
-                            div { class: "panel-title", "SETTINGS · ID {motor_id()}" }
-                            div { class: "eyebrow", if feedback_id() == motor_id() { "ONLINE" } else { "WAITING" } }
-                        }
-                        div { class: "servo-row",
-                            div { class: "servo-readout", div { class: "eyebrow", "TARGET" }, strong { "{target_position():+.1}" }, span { "{mode_unit(control_mode())}" } }
-                            div { class: "state-grid",
-                                div { span { "SERVO ID" }, strong { "{motor_id()}" } }
-                                div { span { "MODE" }, strong { "{mode_label(control_mode())}" } }
-                                div { span { "KP / KD" }, strong { "{kp():.2} / {kd():.2}" } }
-                                div { span { "REALTIME" }, strong { "ON" } }
-                            }
-                        }
-                        div { class: "servo-footer",
-                            div { class: "id-switch",
-                                if known_ids().is_empty() {
-                                    span { class: "id-empty", "NO DISCOVERED ID" }
-                                }
-                                for id in known_ids() {
-                                    button { class: if motor_id() == id { "id-btn active" } else { "id-btn" }, onclick: move |_| motor_id.set(id), "ID {id}" }
-                                }
-                            }
-                            div { class: "packet-count", "VALID RX  ", strong { "{rx_count()}" } }
+                button { disabled:connected(), onclick:move |_| {
+                    let found = scan_serial_ports();
+                    if !found.contains(&port()) {port.set(found.first().cloned().unwrap_or_default());}
+                    ports.set(found);
+                }, "刷新" }
+                button { id:"connect", class:if connected() {""} else {"primary"}, onclick:move |_| {
+                    if connected() { link.disconnect(); connected.set(false); feedback.set(None); received.set(0); ids.set(vec![]); status.set("未应用控制".into()); }
+                    else if port().is_empty() {show_error(message,"请接入串口适配器，刷新后选择串口。","connect");}
+                    else if link.connect(&port()).is_ok() { connected.set(true); }
+                    else {show_error(message,"无法打开串口。请检查适配器连接，并关闭占用该串口的程序。","port");}
+                }, if connected() {"断开连接"} else {"连接串口"} }
+                small { "6 Mbps · 8N1" }
+            }
+            div { class:"workspace",
+                section { class:"panel",
+                    div { class:"control-head",
+                    h1 { "运动控制" }
+                    div { class:"tabs", role:"group", aria_label:"控制逻辑",
+                        for (label,next,active) in [("常规控制",basic(),mode()!=Mode::Mit),("MIT 控制",Mode::Mit,mode()==Mode::Mit)] {
+                            button { aria_pressed:"{active}", onclick:move |_|switch_mode.call(next), "{label}" }
                         }
                     }
-                    section { class: "panel telemetry",
-                        div { class: "panel-head", div { class: "panel-title", "FEEDBACK · ID {feedback_id()}" }, div { class: "eyebrow", if feedback_id() == motor_id() { "OK" } else { "--" } } }
-                        div { class: "telemetry-stack",
-                            div { class: "telemetry-row", div { div { class: "telemetry-name", "Output position" }, div { class: "telemetry-value", "{position_degrees(position()):+.1}", span { class: "telemetry-unit", "°" } } } }
-                            div { class: "telemetry-row", div { div { class: "telemetry-name", "Output velocity" }, div { class: "telemetry-value", "{speed_degrees(speed()):+.1}", span { class: "telemetry-unit", "°/s" } } } }
-                            div { class: "telemetry-row", div { div { class: "telemetry-name", "Output torque" }, div { class: "telemetry-value", "{torque():+.2}", span { class: "telemetry-unit", "N·m" } } } }
-                            div { class: "telemetry-row compact", div { span { class: "telemetry-name", "Housing" }, strong { "{temperature()}°C" } }, div { span { class: "telemetry-name", "Bus" }, strong { "{voltage():.1} V" } } }
-                            div { class: "telemetry-row compact", div { span { class: "telemetry-name", "Error" }, strong { if error() == 0 { "NONE" } else { "{error()}" } } }, div { span { class: "telemetry-name", "Warning" }, strong { if warning() == 0 { "NONE" } else { "{warning()}" } } } }
-                        }
                     }
-                    section { class: "panel control-panel",
-                        div { class: "panel-head", div { class: "panel-title", "CONTROL · {mode_label(control_mode())}" }, div { class: "eyebrow", "LIVE" } }
-                        div { class: "control-layout",
-                            div { class: "control-group",
-                            div { class: "control-label", "SERVO ID" }
-                                input { class: "id-input", r#type: "number", min: "0", max: "15", value: "{motor_id()}", oninput: move |event| motor_id.set(event.value().parse().unwrap_or(0).clamp(0, 15)) }
-                                div { class: "mode-switch",
-                                    for mode in [ControlMode::Position, ControlMode::Velocity, ControlMode::Torque] {
-                                        button { class: if control_mode() == mode { "mode-btn active" } else { "mode-btn" }, onclick: mode_handler(serial.clone(), last_command, motor_id, control_mode, target_position, kp, kd, mode), "{mode_label(mode)}" }
-                                    }
+                    div { class:"setup",
+                        label { r#for:"motor","电机 ID" }
+                        select { id:"motor", value:"{id()}", onchange:move |e|if let Ok(v)=e.value().parse(){id.set(v)},
+                            for n in 0u8..16 { option { value:"{n}", if ids.read().contains(&n) {"{n} · 已发现"} else {"{n}"} } }
+                        }
+                        if mode()!=Mode::Mit {
+                            div { class:"segments", role:"group", aria_label:"常规控制模式",
+                                for m in [Mode::Position,Mode::Velocity,Mode::Torque] {
+                                    button { aria_pressed:"{mode()==m}", onclick:move |_|switch_mode.call(m), "{m.label()}" }
                                 }
-                                div { class: "control-label", "TARGET  ·  {target_position():.3} {mode_unit(control_mode())}" }
-                                input { class: "range position-range", r#type: "range", min: "{mode_min(control_mode())}", max: "{mode_max(control_mode())}", step: "{mode_step(control_mode())}", value: "{target_position():.3}", oninput: live_control_handler(serial.clone(), last_command, motor_id, control_mode, target_position, kp, kd) }
-                                div { class: "range-ends", span { "{mode_min(control_mode()):.3} {mode_unit(control_mode())}" }, span { "0" }, span { "+{mode_max(control_mode()):.3} {mode_unit(control_mode())}" } }
                             }
-                            div { class: "control-group gain-group",
-                                div { class: "control-label", "KP  ·  {kp():.1}" }
-                                input { class: "range", r#type: "range", min: "0", max: "10", step: "0.01", value: "{kp()}", oninput: live_gain_handler(serial.clone(), last_command, motor_id, control_mode, target_position, kp, kd, true) }
-                                div { class: "range-ends", span { "0" }, span { "10" } }
-                                div { class: "control-label", "KD  ·  {kd():.3}" }
-                                input { class: "range", r#type: "range", min: "0", max: "10", step: "0.01", value: "{kd()}", oninput: live_gain_handler(serial.clone(), last_command, motor_id, control_mode, target_position, kp, kd, false) }
-                                div { class: "range-ends", span { "0" }, span { "10" } }
-                            }
-                            div { class: "realtime-note", span { class: "status-dot" }, "LIVE" }
                         }
-                        div { class: "command-log", span { "LAST EVENT" }, strong { "{last_command()}" } }
                     }
+                    div { class:"fields",
+                        for &i in mode().fields() {
+                            div { class:"field", key:"{i}",
+                                label { r#for:"value-{i}", "{FIELDS[i].0}" }
+                                div { class:"edit",
+                                    input { id:"value-{i}", r#type:"number", min:"{FIELDS[i].2}", max:"{FIELDS[i].3}", step:"{FIELDS[i].4}", value:"{draft.read()[i]}", oninput:move |e|draft.write()[i]=e.value() }
+                                    span { "{FIELDS[i].1}" }
+                                }
+                                input { class:"slider", r#type:"range", aria_label:"{FIELDS[i].0} {FIELDS[i].1}", min:"{FIELDS[i].2}", max:"{FIELDS[i].3}", step:"{FIELDS[i].4}", value:"{draft.read()[i]}", oninput:move |e|draft.write()[i]=e.value() }
+                                div { class:"limits", span {"{FIELDS[i].2}"} span {"{FIELDS[i].3}"} }
+                            }
+                        }
+                    }
+                    footer { button { class:"primary", id:"apply", disabled:!connected(), onclick:move |_| {
+                        match setpoint(mode(), &draft.read()) {
+                            Err(invalid) => {
+                                let fields = invalid.iter().map(|&i|format!("{}（{} 至 {}）", FIELDS[i].0,FIELDS[i].2,FIELDS[i].3)).collect::<Vec<_>>().join("、");
+                                show_error(message,format!("请输入有效数值：{fields}"),&format!("value-{}",invalid[0]));
+                            }
+                            Ok(command) => match serial.send_control(id(), command) {
+                                Ok(()) => status.set(format!("ID {} · {}控制已应用",id(),mode().label())),
+                                Err(()) => show_error(message,"指令未收到目标电机反馈。请检查电机 ID 和接线。","apply"),
+                            }
+                        }
+                    }, "应用控制" } small { role:"status", "{status()}" } }
+                }
+                section { class:"panel feedback",
+                    div { class:"heading", h2 { "实时反馈" } small { "{feedback_state}" } }
+                    for (name,unit,value) in measurements {
+                        div { class:"reading", span {"{name}"} div { strong {"{value.as_deref().unwrap_or(\"—\")}"} small {"{unit}"} } }
+                    }
+                    h3 { "设备状态" }
+                    dl { for (name,value) in health { div {dt {"{name}"} dd {"{value.as_deref().unwrap_or(\"—\")}"} } } }
+                    div { class:"frames", span {"有效反馈帧"} strong {"{received()}"} }
                 }
             }
         }
+        dialog { aria_labelledby:"error-heading",
+            h2 { id:"error-heading","操作未完成" } p {"{message()}"} div { class:"dialog-actions", button {class:"primary",autofocus:true,onclick:move |_| { document::eval("document.querySelector('dialog').close()"); },"确认"} }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn control_modes_map_only_their_own_parameters() {
+        let draft = ["45", "12", "2", "8", "0.4"].map(str::to_owned);
+        let mit = setpoint(Mode::Mit, &draft).unwrap();
+        assert_eq!(
+            mit,
+            Setpoint {
+                position_deg: 45.,
+                velocity_deg_s: 12.,
+                torque_nm: 2.,
+                kp: 8.,
+                kd: 0.4
+            }
+        );
+        assert_eq!(
+            setpoint(Mode::Position, &draft).unwrap(),
+            Setpoint {
+                velocity_deg_s: 0.,
+                torque_nm: 0.,
+                ..mit
+            }
+        );
+        assert_eq!(
+            setpoint(Mode::Velocity, &draft).unwrap(),
+            Setpoint {
+                velocity_deg_s: 12.,
+                kd: 0.4,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            setpoint(Mode::Torque, &draft).unwrap(),
+            Setpoint {
+                torque_nm: 2.,
+                ..Default::default()
+            }
+        );
     }
 }

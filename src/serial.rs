@@ -1,6 +1,5 @@
 use crate::protocol::{build_control_packet, take_feedback, Feedback};
 use serialport::SerialPort;
-use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,20 +8,19 @@ use std::time::{Duration, Instant};
 
 pub const SERIAL_BAUD: u32 = 6_000_000;
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum ControlMode {
-    Position,
-    Velocity,
-    Torque,
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Setpoint {
+    pub position_deg: f64,
+    pub velocity_deg_s: f64,
+    pub torque_nm: f64,
+    pub kp: f64,
+    pub kd: f64,
 }
 
 #[derive(Clone, Copy)]
 struct ActiveCommand {
     motor_id: u8,
-    mode: ControlMode,
-    target: f64,
-    kp: f64,
-    kd: f64,
+    setpoint: Setpoint,
 }
 
 #[derive(Clone)]
@@ -30,8 +28,8 @@ pub struct SerialManager {
     port: Arc<Mutex<Option<Box<dyn SerialPort>>>>,
     generation: Arc<AtomicU64>,
     pub connected: Arc<AtomicBool>,
-    rx_log: Arc<Mutex<VecDeque<String>>>,
-    latest: Arc<Mutex<Option<Feedback>>>,
+    rx_count: Arc<AtomicU64>,
+    latest: Arc<Mutex<Option<(Feedback, Instant)>>>,
     discovered: Arc<Mutex<Vec<u8>>>,
     active: Arc<Mutex<Option<ActiveCommand>>>,
 }
@@ -42,7 +40,7 @@ impl SerialManager {
             port: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             connected: Arc::new(AtomicBool::new(false)),
-            rx_log: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
+            rx_count: Arc::new(AtomicU64::new(0)),
             latest: Arc::new(Mutex::new(None)),
             discovered: Arc::new(Mutex::new(Vec::new())),
             active: Arc::new(Mutex::new(None)),
@@ -68,7 +66,6 @@ impl SerialManager {
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.connected.store(true, Ordering::SeqCst);
-        self.push_log(format!("LINK  {path}  /  {SERIAL_BAUD}  8N1"));
 
         let worker = self.clone();
         thread::Builder::new()
@@ -78,28 +75,26 @@ impl SerialManager {
                 while worker.connected.load(Ordering::SeqCst)
                     && worker.generation.load(Ordering::SeqCst) == generation
                 {
-                    if let Some(command) = worker.active_command() {
-                        let _ = worker.transact_mode(
-                            command.motor_id,
-                            command.mode,
-                            command.target,
-                            command.kp,
-                            command.kd,
-                            1,
-                        );
-                        thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
-                    for id in 0_u8..=15_u8 {
+                    for id in 0..=15 {
+                        let Ok(active) = worker.active.lock() else {
+                            return;
+                        };
                         if worker.generation.load(Ordering::SeqCst) != generation {
                             return;
                         }
-                        let _ = worker.transact(id, 0.0, 0.0, 0.0, 0.0, 0.0);
+                        if let Some(command) = *active {
+                            worker.transact(command.motor_id, command.setpoint, 1);
+                            break;
+                        }
+                        worker.transact(id, Setpoint::default(), 0);
                     }
                     thread::sleep(Duration::from_millis(18));
                 }
             })
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| {
+                self.disconnect();
+                err.to_string()
+            })?;
         Ok(())
     }
 
@@ -112,60 +107,44 @@ impl SerialManager {
         if let Ok(mut ids) = self.discovered.lock() {
             ids.clear();
         }
-        self.clear_active();
-    }
-
-    pub fn send_control(
-        &self,
-        label: &str,
-        motor_id: u8,
-        mode: ControlMode,
-        target: f64,
-        kp: f64,
-        kd: f64,
-    ) -> Result<(), String> {
-        let feedback = self.transact_mode(motor_id, mode, target, kp, kd, 1);
-        if feedback.is_some() {
-            if let Ok(mut active) = self.active.lock() {
-                *active = Some(ActiveCommand {
-                    motor_id,
-                    mode,
-                    target,
-                    kp,
-                    kd,
-                });
-            }
-            self.push_log(format!("TX  {label}  /  ID{motor_id}  /  FE EE + CRC32"));
-            Ok(())
-        } else {
-            Err("未收到有效 FC EE 反馈帧".to_string())
+        if let Ok(mut active) = self.active.lock() {
+            *active = None;
         }
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = None;
+        }
+        self.rx_count.store(0, Ordering::Relaxed);
     }
 
-    fn transact(
-        &self,
-        motor_id: u8,
-        torque: f64,
-        speed: f64,
-        position: f64,
-        kp: f64,
-        kd: f64,
-    ) -> Option<Feedback> {
-        self.transact_with_timeout(motor_id, torque, speed, position, kp, kd, 0)
+    pub fn send_control(&self, motor_id: u8, setpoint: Setpoint) -> Result<(), ()> {
+        let mut active = self.active.lock().map_err(|_| ())?;
+        self.transact(motor_id, setpoint, 1).ok_or(())?;
+        *active = Some(ActiveCommand { motor_id, setpoint });
+        Ok(())
     }
 
-    fn transact_with_timeout(
-        &self,
-        motor_id: u8,
-        torque: f64,
-        speed: f64,
-        position: f64,
-        kp: f64,
-        kd: f64,
-        timeout_bit: u8,
-    ) -> Option<Feedback> {
-        let packet =
-            build_control_packet(motor_id, 1, timeout_bit, torque, speed, position, kp, kd);
+    pub fn stop(&self, selected_id: u8) -> Result<u8, ()> {
+        let mut active = self.active.lock().map_err(|_| ())?;
+        let id = active.map_or(selected_id, |command| command.motor_id);
+        let neutral = Setpoint::default();
+        *active = Some(ActiveCommand {
+            motor_id: id,
+            setpoint: neutral,
+        });
+        self.transact(id, neutral, 1).map(|_| id).ok_or(())
+    }
+
+    fn transact(&self, motor_id: u8, setpoint: Setpoint, timeout: u8) -> Option<Feedback> {
+        let packet = build_control_packet(
+            motor_id,
+            1,
+            timeout,
+            setpoint.torque_nm,
+            setpoint.velocity_deg_s.to_radians(),
+            setpoint.position_deg.to_radians(),
+            setpoint.kp,
+            setpoint.kd,
+        );
         let mut guard = self.port.lock().ok()?;
         let port = guard.as_mut()?;
         port.write_all(&packet).ok()?;
@@ -178,9 +157,9 @@ impl SerialManager {
             match port.read(&mut chunk) {
                 Ok(size) if size > 0 => {
                     stream.extend_from_slice(&chunk[..size]);
-                    if let Some(feedback) = take_feedback(&mut stream) {
+                    while let Some(feedback) = take_feedback(&mut stream) {
                         if let Ok(mut latest) = self.latest.lock() {
-                            *latest = Some(feedback.clone());
+                            *latest = Some((feedback.clone(), Instant::now()));
                         }
                         if let Ok(mut ids) = self.discovered.lock() {
                             if !ids.contains(&feedback.motor_id) {
@@ -188,15 +167,10 @@ impl SerialManager {
                                 ids.sort_unstable();
                             }
                         }
-                        self.push_log(format!(
-                            "RX ID{} T{}°C {:.1}V P{:+.2}rad E{} W{} CRC OK",
-                            feedback.motor_id,
-                            feedback.temp,
-                            feedback.voltage,
-                            feedback.position,
-                            feedback.error,
-                            feedback.warning
-                        ));
+                        self.rx_count.fetch_add(1, Ordering::Relaxed);
+                        if feedback.motor_id != motor_id {
+                            continue;
+                        }
                         return Some(feedback);
                     }
                 }
@@ -208,15 +182,14 @@ impl SerialManager {
         None
     }
 
-    pub fn take_logs(&self) -> Vec<String> {
-        self.rx_log
-            .lock()
-            .map(|mut logs| logs.drain(..).collect())
-            .unwrap_or_default()
+    pub fn rx_count(&self) -> u64 {
+        self.rx_count.load(Ordering::Relaxed)
     }
 
     pub fn latest(&self) -> Option<Feedback> {
-        self.latest.lock().ok().and_then(|latest| latest.clone())
+        let latest = self.latest.lock().ok()?;
+        let (feedback, at) = latest.as_ref()?;
+        (at.elapsed() < Duration::from_secs(2)).then(|| feedback.clone())
     }
 
     pub fn discovered_ids(&self) -> Vec<u8> {
@@ -224,42 +197,6 @@ impl SerialManager {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default()
-    }
-
-    fn active_command(&self) -> Option<ActiveCommand> {
-        self.active.lock().ok().and_then(|command| *command)
-    }
-
-    fn clear_active(&self) {
-        if let Ok(mut active) = self.active.lock() {
-            *active = None;
-        }
-    }
-
-    fn transact_mode(
-        &self,
-        motor_id: u8,
-        mode: ControlMode,
-        target: f64,
-        kp: f64,
-        kd: f64,
-        timeout_bit: u8,
-    ) -> Option<Feedback> {
-        let (torque, speed, position, kp, kd) = match mode {
-            ControlMode::Position => (0.0, 0.0, target.to_radians(), kp, kd),
-            ControlMode::Velocity => (0.0, target.to_radians(), 0.0, 0.0, kd),
-            ControlMode::Torque => (target, 0.0, 0.0, 0.0, 0.0),
-        };
-        self.transact_with_timeout(motor_id, torque, speed, position, kp, kd, timeout_bit)
-    }
-
-    fn push_log(&self, message: String) {
-        if let Ok(mut logs) = self.rx_log.lock() {
-            if logs.len() >= 64 {
-                logs.pop_front();
-            }
-            logs.push_back(message);
-        }
     }
 }
 
@@ -274,4 +211,65 @@ pub fn scan_serial_ports() -> Vec<String> {
         .unwrap_or_default();
     ports.sort();
     ports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_replaces_active_command_even_without_feedback() {
+        let manager = SerialManager::new();
+        *manager.active.lock().unwrap() = Some(ActiveCommand {
+            motor_id: 7,
+            setpoint: Setpoint {
+                torque_nm: 1.0,
+                ..Default::default()
+            },
+        });
+        assert!(manager.stop(2).is_err());
+        let stopped = manager.active.lock().unwrap().unwrap();
+        assert_eq!(stopped.motor_id, 7);
+        assert_eq!(stopped.setpoint, Setpoint::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_sends_neutral_frame_to_active_motor() {
+        use crate::protocol::{crc32_core, CMD_LEN, FB_LEN};
+        let manager = SerialManager::new();
+        let (mut device, mut host) = serialport::TTYPort::pair().unwrap();
+        device.set_timeout(Duration::from_secs(1)).unwrap();
+        host.set_timeout(Duration::from_millis(8)).unwrap();
+        *manager.port.lock().unwrap() = Some(Box::new(host));
+        let device_task = thread::spawn(move || {
+            for torque in [1.0, 0.0] {
+                let mut packet = [0; CMD_LEN];
+                device.read_exact(&mut packet).unwrap();
+                assert_eq!(
+                    packet,
+                    build_control_packet(7, 1, 1, torque, 0.0, 0.0, 0.0, 0.0)
+                );
+                let mut feedback = [0; FB_LEN];
+                feedback[..3].copy_from_slice(&[0xfc, 0xee, 7]);
+                let crc = crc32_core(&feedback[2..22]);
+                feedback[22..].copy_from_slice(&crc.to_le_bytes());
+                device.write_all(&feedback).unwrap();
+                // PTY writes are unbuffered. Draining both ends can deadlock on macOS.
+            }
+            // Keep the peer open until the last response has been consumed.
+            thread::sleep(Duration::from_millis(50));
+        });
+        manager
+            .send_control(
+                7,
+                Setpoint {
+                    torque_nm: 1.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(manager.stop(2), Ok(7));
+        device_task.join().unwrap();
+    }
 }
